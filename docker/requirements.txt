@@ -1,0 +1,2 @@
+scikit-sparse==0.4.12  # For sparse linear algebra operations; e.g., sparse Cholesky
+river==0.15.0  # Library for online ML
