@@ -5,6 +5,7 @@ from river.tree import SGTRegressor
 from river.tree.splitter import DynamicQuantizer  # The default quantizer was throwing errors
 import numpy as np
 import scipy
+import scipy.sparse
 from scipy.stats import norm, gamma
 from sksparse.cholmod import cholesky
 from sklearn.base import BaseEstimator
@@ -200,14 +201,15 @@ class RoME(BaseTS):
         L_user: scipy.sparse._csr.csr_matrix, L_time: scipy.sparse._csr.csr_matrix,
         user_cov: np.ndarray, time_cov: np.ndarray, lambda_penalty: float = 1., ml_interactions: bool = False,
         ml_model: BaseEstimator = RiverBatchEstimator(BaggingRegressor(SGTRegressor(delta=0.05, grace_period=50, feature_quantizer=DynamicQuantizer(), lambda_value=0., gamma=0.), n_models=100, subsample=0.8)),
-        sigma: float = 1., delta: float = 0.01, b_user: float = 0.1, b_time: float = 0.1,
-        d_user: float = 1., d_time: float = 1., n_neighbors: int= 1, pool_users: bool = True) -> None:
+        v: float = 1., delta: float = 0.01, zeta: float = 10.,
+        n_neighbors: int= 1, pool_users: bool = True) -> None:
         self.pool_users = pool_users
         if not pool_users:
             n_max = 1
             L_user = scipy.sparse.csr_matrix([[0.]])
         self.n_max = n_max
         self.t_max = t_max
+        self.K = max(n_max, t_max)
         self.p = p
         self.num_thetas = 1 + n_max + t_max
         self.theta_dim = p * self.num_thetas
@@ -223,22 +225,11 @@ class RoME(BaseTS):
         self.time_precision = np.linalg.inv(time_cov)
         self.gamma_time = np.linalg.eigvals(self.time_precision).max()
         self.lambda_penalty = lambda_penalty
-        self.sigma = sigma
+        self.v = v
         self.delta = delta
-        self.b_user = b_user
-        self.b_time = b_time
-        self.d_user = d_user
-        self.d_time = d_time
         self.n_neighbors = n_neighbors
-        self.beta_const = (
-            self.n_neighbors * self.lambda_penalty * (
-                self.d_user / np.sqrt(self.gamma_user) +
-                self.d_time / np.sqrt(self.gamma_time) ) +
-            np.sqrt(self.n_max) * (
-                np.sqrt(self.gamma_user) * self.b_user +
-                np.sqrt(self.gamma_time) * self.b_time
-            )
-        )  # NOTE: This is labeled as B in the paper
+        self.zeta = zeta
+        self.beta_const = self.zeta * max(1., np.log(self.K)**(0.75))
 
         self._initialize_priors()
     
@@ -246,11 +237,6 @@ class RoME(BaseTS):
         if not self.pool_users:
             user_idx = np.zeros_like(user_idx, dtype=int)
         n_obs = len(user_idx)
-        beta = self.sigma * np.sqrt(2*(
-            self.V_cholesky.logdet() - 
-                self.log_det_V0 -
-                np.log(self.delta/2.)
-        )) + self.beta_const
 
         # Update theta_hat
         theta_hat = self.V_cholesky(self.b)
@@ -259,10 +245,31 @@ class RoME(BaseTS):
         phi_ones = self._make_phi(context, np.ones(n_obs), user_idx, time_idx).tocsr()
         advantage_mean = phi_ones @ theta_hat
         advantage_vars = []
-        for i in range(n_obs):
-            phi_i = phi_ones[[i]]
-            advantage_var_i = phi_i @ self.V_cholesky(phi_i.T.tocsc() * (beta / self.first_beta)**2)
-            advantage_vars.append(advantage_var_i[0, 0])
+        for j in range(n_obs):
+            phi_j = phi_ones[[j]]
+            i = user_idx[j]
+            t = time_idx[j]
+            I_p = scipy.sparse.identity(self.p, format="csr")
+            C = scipy.sparse.hstack([
+                I_p,
+                scipy.sparse.csr_matrix((self.p, self.p * i)),
+                I_p,
+                scipy.sparse.csr_matrix((self.p, self.p * (self.n_max-i+t-1))),
+                I_p,
+                scipy.sparse.csr_matrix((self.p, self.p * (self.t_max-t-1))),
+            ])
+            Ct = C.T.tocsc()
+            Vi_Ct = self.V_cholesky(Ct)
+            V_bar = (C @ Vi_Ct).toarray()
+            Lambda = (Vi_Ct.T @ self.V0 @ Vi_Ct).toarray()
+            k = i + t + 1
+            beta = self.v * np.sqrt(
+                2 * np.log(2*self.K*(self.K+1)/self.delta) +
+                + np.linalg.slogdet(V_bar)[1]
+                - np.linalg.slogdet(Lambda)[1]
+            ) + self.beta_const
+            advantage_var_j = phi_j @ self.V_cholesky(phi_j.T.tocsc() * (beta / self.first_beta)**2)
+            advantage_vars.append(advantage_var_j[0, 0])
         advantage_vars = np.asarray(advantage_vars)
         self.pi = norm.cdf(np.zeros(n_obs), loc=advantage_mean, scale=np.sqrt(advantage_vars))
 
@@ -343,11 +350,13 @@ class RoME(BaseTS):
 
         # Final matrices        
         self.V = scipy.sparse.block_diag([V_shared, V_user, V_time], format="csc")
+        self.V0 = self.V.copy()
         self.V_cholesky = cholesky(self.V.tocsc())  # Could use Taylor series approximation
         self.log_det_V0 = self.V_cholesky.logdet()
         self.b = np.zeros((1+self.n_max+self.t_max) * self.p)
         self.stage = 1
-        self.first_beta = self.sigma * np.sqrt(-2. * np.log(self.delta)) + self.beta_const
+        self.first_beta = self.v * np.sqrt(2 * np.log(2*self.K*(self.K+1)/self.delta)) + self.beta_const
+        # NOTE: The determinant term is one at the first stage
 
     def reset(self) -> 'RoME':
         self._initialize_priors()
